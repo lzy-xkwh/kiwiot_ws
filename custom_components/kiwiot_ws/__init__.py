@@ -11,7 +11,7 @@ from .conn.token_manager import TokenManager
 
 _LOGGER = logging.getLogger(f"{LOGGER_NAME}_{__name__}")
 
-PLATFORMS = [Platform.SENSOR, Platform.CAMERA, Platform.TEXT, Platform.BUTTON]
+PLATFORMS = [Platform.LOCK, Platform.SENSOR, Platform.CAMERA, Platform.TEXT, Platform.BUTTON]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """设置配置项"""

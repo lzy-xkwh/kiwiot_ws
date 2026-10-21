@@ -1,21 +1,33 @@
 {
-    "config": {
-        "step": {
-            "user": {
-                "title": "优质websocket",
-                "description": "请输入您的凭据以连接到KiwiOT。",
-                "data": {
-                    "identifier": "手机号（+XX的国际区号开头）或邮箱",
-                    "credential": "密码",
-                    "X-Kiwik-Client-Id": "Client ID",
-                    "ignore_ssl": "忽略SSL证书验证（不安全）"
-                }
-            }
-        },
-        "error": {
-            "identifier_too_short": "错误格式账号",
-            "identifier_invalid_format": "手机号必须以+XX的国际区号开头或邮箱",
-            "missing_fields": "请填写所有必填项"
+  "config": {
+    "step": {
+      "user": {
+        "title": "KiwiOT",
+        "description": "Enter your credentials to connect to KiwiOT.",
+        "data": {
+          "identifier": "Phone number or email",
+          "credential": "Password",
+          "X-Kiwik-Client-Id": "Client ID",
+          "ignore_ssl": "Ignore SSL certificate verification (unsafe)"
         }
+      }
+    },
+    "error": {
+      "identifier_too_short": "Invalid account format",
+      "identifier_invalid_format": "Enter a valid phone number or email",
+      "missing_fields": "All required fields must be completed"
     }
+  },
+  "entity": {
+    "lock": {
+      "lock": {
+        "name": "Lock"
+      }
+    },
+    "sensor": {
+      "battery": {
+        "name": "Battery"
+      }
+    }
+  }
 }

@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from .const import LOGGER_NAME
 from .conn.userinfo import (
     get_ggid, 
@@ -6,7 +6,8 @@ from .conn.userinfo import (
     get_llock_userinfo, 
     get_llock_info, 
     get_llock_video, 
-    get_user_info
+    get_user_info,
+    get_device_info,
     )
 from .entity.lock import (
     KiwiLockDevice, 
@@ -17,6 +18,8 @@ from .entity.lock import (
     KiwiLockStatus
     )
 from .entity.lock_ctrl import KiwiLockPasswordInput, KiwiLockPasswordConfirm, KiwiLockUnlockDataInput
+from .lock import KiwiLockEntity
+from .battery_sensor import KiwiLockBatterySensor
 from .conn.utils import (
     get_latest_event, 
     get_history_events, 
@@ -44,7 +47,10 @@ async def initialize_devices_and_groups(hass, entry, session, callback):
             for device_info in devices:
                 if device_info["type"] == "LOCK":
                     lock_device = KiwiLockDevice(hass, device_info, group["gid"], group["name"])
-                    _LOGGER.info(f"设备信息: {lock_device.device_info}")  
+                    _LOGGER.info(f"设备信息: {lock_device.device_info}")
+                    detailed_device_info = await get_device_info(
+                        hass, entry, device_info["did"], session
+                    )
 
                     users = await get_llock_userinfo(hass, entry, device_info["did"], session)
                     master = await get_user_info(hass, entry, session)
@@ -64,7 +70,14 @@ async def initialize_devices_and_groups(hass, entry, session, callback):
                     password_input = KiwiLockPasswordInput(hass, lock_device, master_uid, device_info["did"])
                     unlock_data_input = KiwiLockUnlockDataInput(hass, lock_device, master_uid, device_info["did"])
                     password_confirm = KiwiLockPasswordConfirm(hass, entry, lock_device, master_uid, device_info["did"], password_input, unlock_data_input)
+                    battery_data = {
+                        "device": device_info,
+                        "details": detailed_device_info,
+                        "events": events,
+                    }
                     device_entities = [
+                        KiwiLockEntity(lock_device, latest_event),
+                        KiwiLockBatterySensor(lock_device, battery_data),
                         KiwiLockStatus(hass, lock_device, latest_event, history_events),  
                         KiwiLockEvent(hass, lock_device, latest_event, history_events, users),  
                         KiwiLockInfo(hass, lock_device, group),

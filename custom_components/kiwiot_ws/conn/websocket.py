@@ -8,11 +8,14 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any
 from ..entity.lock import KiwiLockEvent, KiwiLockCamera, KiwiLockStatus
+from ..lock import KiwiLockEntity
+from ..battery_sensor import KiwiLockBatterySensor
 from ..const import LOGGER_NAME, WS_URL, DOMAIN
 from .utils import convert_wsevent_format, convert_media_event_format
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from .userinfo import get_llock_userinfo
 from .token_manager import TokenManager
+from ..event_utils import event_name, event_label, lock_state
 
 _LOGGER = logging.getLogger(f"{LOGGER_NAME}_{__name__}")
 
@@ -207,22 +210,48 @@ async def process_device_event(hass, entry, data):
     """处理设备事件通知"""
     payload = data.get("payload", {})
     device_id = payload.get("did")
-    event_name = payload.get("name")
     event_type = payload.get("level")
+    normalized_name = event_name(payload)
     
     try:
-        if event_name in {"UNLOCKED", "LOCKED"}:
+        await update_battery_state(hass, device_id, payload)
+        if normalized_name in {"UNLOCKED", "LOCKED", "LOCK_INDOOR_BUTTON_UNLOCK", "LOCK_INDOOR_LEVER_UNLOCK"}:
             payload = await convert_wsevent_format(payload)
-        elif event_type == "CRITICAL" and event_name == "REMOTE_UNLOCK":
+        elif event_type == "CRITICAL" and normalized_name == "REMOTE_UNLOCK":
             payload = await convert_media_event_format(payload)
         else:
-            _LOGGER.warning(f"未知事件类型: {payload}")
-            
-        _LOGGER.debug(f"事件数据格式化: {payload}")
+            # Keep the original payload for alarms, user changes, battery and
+            # future server-side event types instead of dropping them.
+            payload = dict(payload)
+            payload["name"] = normalized_name or "UNKNOWN"
+            payload.setdefault("data", {})
+            _LOGGER.debug("Received KiwiOT event: %s (%s)", event_label(payload), event_type)
         await update_device_state(hass, entry, device_id, payload)
+        hass.bus.async_fire(
+            f"{DOMAIN}_event",
+            {
+                "device_id": device_id,
+                "event": normalized_name or "UNKNOWN",
+                "label": event_label(payload),
+                "level": event_type,
+                "created_at": payload.get("created_at"),
+                "data": payload.get("data", {}),
+            },
+        )
         
     except Exception as e:
-        _LOGGER.error(f"处理设备事件失败: {e}")
+        _LOGGER.error("处理设备事件失败: %s", e)
+
+async def update_battery_state(hass, device_id, payload):
+    """Update a lock battery sensor directly from an unmodified payload."""
+    device_entities = (
+        hass.data.get(DOMAIN, {}).get("devices", {}).get(device_id, [])
+    )
+    for entity in device_entities:
+        if isinstance(entity, KiwiLockBatterySensor):
+            if entity.update_from_payload(payload):
+                entity.async_write_ha_state()
+
 
 async def update_device_state(hass, entry, device_id, event_data):
     """根据WebSocket消息更新设备实体状态"""
@@ -243,9 +272,16 @@ async def update_device_state(hass, entry, device_id, event_data):
         
         update_tasks = []
         for entity in device_entities:
-            if isinstance(entity, KiwiLockEvent):
+            if isinstance(entity, KiwiLockBatterySensor):
+                if entity.update_from_payload(event_data):
+                    entity.async_write_ha_state()
+            elif isinstance(entity, KiwiLockEntity):
+                if lock_state(event_data) is not None:
+                    entity.update_from_event(event_data)
+                    entity.async_write_ha_state()
+            elif isinstance(entity, KiwiLockEvent):
                 update_tasks.append(update_lock_event(entity, event_data, users))
-            elif isinstance(entity, KiwiLockStatus) and event_data.get("name") in {"UNLOCKED", "LOCKED", "LOCK_INDOOR_BUTTON_UNLOCK"}:
+            elif isinstance(entity, KiwiLockStatus) and lock_state(event_data) is not None:
                 update_tasks.append(update_lock_status(entity, event_data))
             elif isinstance(entity, KiwiLockCamera) and event_data.get("data"):
                 update_tasks.append(update_camera(entity, event_data))

@@ -2,20 +2,42 @@
   "config": {
       "step": {
           "user": {
-              "title": "优质websocket",
-              "description": "请输入您的凭据以连接到KiwiOT。",
+              "title": "优智云家",
+              "description": "请输入您的凭据以连接到 KiwiOT。",
               "data": {
-                  "identifier": "手机号（+XX的国际区号开头）或邮箱",
+                  "identifier": "手机号或邮箱",
                   "credential": "密码",
                   "X-Kiwik-Client-Id": "Client ID",
-                  "ignore_ssl": "忽略SSL证书验证（不安全）"
+                  "ignore_ssl": "忽略 SSL 证书验证（不安全）"
+              }
+          },
+          "reauth_confirm": {
+              "title": "重新验证 KiwiOT 账号",
+              "description": "账号凭据已失效。请重新输入密码并确认 Client ID。",
+              "data": {
+                  "credential": "密码",
+                  "X-Kiwik-Client-Id": "Client ID"
               }
           }
       },
       "error": {
-          "identifier_too_short": "错误格式账号",
-          "identifier_invalid_format": "手机号必须以+XX的国际区号开头或邮箱",
-          "missing_fields": "请填写所有必填项"
+          "identifier_too_short": "账号格式无效",
+          "identifier_invalid_format": "请输入有效的手机号或邮箱",
+          "missing_fields": "请填写所有必填项",
+          "invalid_auth": "认证失败，请检查密码和 Client ID",
+          "cannot_connect": "无法连接到 KiwiOT 服务"
       }
+  },
+  "entity": {
+    "lock": {
+      "lock": {
+        "name": "门锁"
+      }
+    },
+    "sensor": {
+      "battery": {
+        "name": "电量"
+      }
+    }
   }
 }
