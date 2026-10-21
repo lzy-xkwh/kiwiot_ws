@@ -14,6 +14,14 @@ from ..const import BASE_URL, LOGGER_NAME, CONF_IDENTIFIER, CONF_CREDENTIAL, CON
 
 _LOGGER = logging.getLogger(f"{LOGGER_NAME}_{__name__}")
 
+
+def mask_token(token: Optional[str]) -> str:
+    """Return a log-safe representation of a token (never the secret)."""
+    if not token:
+        return "None"
+    return f"{token[:4]}***(len={len(token)})"
+
+
 class TokenManager:
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
         """初始化 TokenManager"""
@@ -44,7 +52,12 @@ class TokenManager:
                         self._refresh_token = data.get("refresh_token")
                         self._expires_at = data.get("expires_at")
                         self._token_type = data.get("token_type", "bearer")
-                        _LOGGER.info(f"已从{self._storage_file}存储加载Token信息:{data}")
+                        _LOGGER.info(
+                            "已从%s存储加载Token信息: expires_at=%s, token=%s",
+                            self._storage_file,
+                            data.get("expires_at"),
+                            mask_token(data.get("access_token")),
+                        )
         except Exception as e:
             _LOGGER.error(f"加载Token存储失败: {e}")
 
@@ -106,17 +119,29 @@ class TokenManager:
                     elif not await self.is_token_valid(session):
                         _LOGGER.warning("Token无效")
                         await self._fetch_new_token(session)
-                        _LOGGER.warning(f"{self._access_token}使用新token, 过期时间: {datetime.fromtimestamp(self._expires_at)}")
+                        _LOGGER.warning(
+                            "使用新token(%s), 过期时间: %s",
+                            mask_token(self._access_token),
+                            datetime.fromtimestamp(self._expires_at),
+                        )
                         return self._access_token
                     else:
                         _LOGGER.warning("未知错误")
                         await self._fetch_new_token(session)
-                        _LOGGER.warning(f"{self._access_token}使用新token, 过期时间: {datetime.fromtimestamp(self._expires_at)}")
+                        _LOGGER.warning(
+                            "使用新token(%s), 过期时间: %s",
+                            mask_token(self._access_token),
+                            datetime.fromtimestamp(self._expires_at),
+                        )
                         return self._access_token
                 else:
-                    _LOGGER.warning(f"Token：{self._access_token} 已过期")
+                    _LOGGER.warning("Token：%s 已过期", mask_token(self._access_token))
                     await self._fetch_new_token(session)
-                    _LOGGER.warning(f"token已刷新：{self._access_token}, 过期时间: {datetime.fromtimestamp(self._expires_at)}")
+                    _LOGGER.warning(
+                        "token已刷新：%s, 过期时间: %s",
+                        mask_token(self._access_token),
+                        datetime.fromtimestamp(self._expires_at),
+                    )
                     return self._access_token
 
                 # if self._refresh_token:

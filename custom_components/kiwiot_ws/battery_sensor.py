@@ -15,7 +15,6 @@ class KiwiLockBatterySensor(SensorEntity):
     """Expose the last valid battery percentage reported by KiwiOT."""
 
     _attr_has_entity_name = True
-    _attr_name = "Battery"
     _attr_translation_key = "battery"
     _attr_should_poll = False
     _attr_device_class = SensorDeviceClass.BATTERY

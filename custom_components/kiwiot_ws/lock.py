@@ -9,10 +9,10 @@ from .event_utils import lock_state
 
 class KiwiLockEntity(LockEntity):
     """Expose last known state; keep remote unlock behind existing MFA flow."""
+    # has_entity_name with no name/translation_key: the entity is the device
+    # itself, so the friendly name is just the device name ("门锁").
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _attr_name = "Lock"
-    _attr_translation_key = "lock"
     def __init__(self, device: object, initial_event: dict | None) -> None:
         self._device = device
         self._event = initial_event or {}

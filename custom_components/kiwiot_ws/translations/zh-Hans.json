@@ -26,14 +26,12 @@
           "missing_fields": "请填写所有必填项",
           "invalid_auth": "认证失败，请检查密码和 Client ID",
           "cannot_connect": "无法连接到 KiwiOT 服务"
+      },
+      "abort": {
+          "reauth_entry_not_found": "未找到对应的配置项，请删除后重新添加"
       }
   },
   "entity": {
-    "lock": {
-      "lock": {
-        "name": "门锁"
-      }
-    },
     "sensor": {
       "battery": {
         "name": "电量"

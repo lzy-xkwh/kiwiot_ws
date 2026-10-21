@@ -10,20 +10,28 @@
           "X-Kiwik-Client-Id": "Client ID",
           "ignore_ssl": "Ignore SSL certificate verification (unsafe)"
         }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate KiwiOT",
+        "description": "Your credentials are no longer valid. Enter the password and confirm the Client ID.",
+        "data": {
+          "credential": "Password",
+          "X-Kiwik-Client-Id": "Client ID"
+        }
       }
     },
     "error": {
       "identifier_too_short": "Invalid account format",
       "identifier_invalid_format": "Enter a valid phone number or email",
-      "missing_fields": "All required fields must be completed"
+      "missing_fields": "All required fields must be completed",
+      "invalid_auth": "Authentication failed, check the password and Client ID",
+      "cannot_connect": "Cannot reach the KiwiOT service"
+    },
+    "abort": {
+      "reauth_entry_not_found": "Config entry not found, please remove and add it again"
     }
   },
   "entity": {
-    "lock": {
-      "lock": {
-        "name": "Lock"
-      }
-    },
     "sensor": {
       "battery": {
         "name": "Battery"

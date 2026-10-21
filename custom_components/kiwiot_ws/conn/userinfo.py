@@ -1,24 +1,27 @@
-﻿import aiohttp
+import aiohttp
 import logging
 from ..const import BASE_URL, LOGGER_NAME, DOMAIN
 from .token_manager import TokenManager
 
 _LOGGER = logging.getLogger(f"{LOGGER_NAME}_{__name__}")
 
-async def _make_request(hass, session, url, error_prefix="获取信息"):
-    
+async def _make_request(hass, session, url, error_prefix="获取信息", quiet_statuses=()):
+    # Never log the query string: every URL here carries ?access_token=...
+    safe_url = url.split("?", 1)[0]
     try:
         async with session.get(url) as response:
             if response.status == 200:
                 return await response.json()
-            else:
-                _LOGGER.error(f"{error_prefix}失败: 状态码 {response.status}")
-                response.raise_for_status()
+            if response.status in quiet_statuses:
+                _LOGGER.debug("%s不可用: 状态码 %s (%s)", error_prefix, response.status, safe_url)
+                return None
+            _LOGGER.error("%s失败: 状态码 %s (%s)", error_prefix, response.status, safe_url)
+            return None
     except aiohttp.ClientError as e:
-        _LOGGER.error(f"在{error_prefix}时发生错误: {e}")
+        _LOGGER.error("在%s时发生错误: %s (%s)", error_prefix, e, safe_url)
         return None
     except Exception as e:
-        _LOGGER.error(f"发生意外错误: {e}")
+        _LOGGER.error("发生意外错误: %s (%s)", error_prefix, e, safe_url)
         return None
 
 async def get_ggid(hass, entry, session):
@@ -39,10 +42,13 @@ async def get_user_info(hass, entry, session):
     url = f"{BASE_URL}/restapi/user?access_token={token}"
     return await _make_request(hass, session, url, "获取用户信息")
 async def get_device_info(hass, entry, did, session):
+    """Optional device-detail endpoint; 404 is normal on most accounts."""
     token_manager = TokenManager(hass, entry)
     token = await token_manager.get_token(session)
     url = f"{BASE_URL}/api/devices/{did}?access_token={token}"
-    return await _make_request(hass, session, url, "获取设备信息")
+    return await _make_request(
+        hass, session, url, "获取设备详情", quiet_statuses=(404,)
+    )
 
 async def get_llock_userinfo(hass, entry, did, session):
     token_manager = TokenManager(hass, entry)
