@@ -23,9 +23,11 @@ _LOGGER = logging.getLogger(f"{LOGGER_NAME}_{__name__}")
 response_futures: Dict[str, asyncio.Future] = {}
 
 # WebSocket 健康检查参数
-WS_SYNC_INTERVAL = 60       # REST 兜底轮询间隔（秒）
-WS_QUIET_WINDOW = 180       # WebSocket 静默超过该时长才启用兜底轮询
-WS_MIN_STABLE_SECONDS = 60  # 连接稳定存活该时长后重置重连退避
+WS_SYNC_INTERVAL = 60        # 兜底同步循环的检查间隔（秒）
+WS_QUIET_WINDOW = 180        # WebSocket 静默超过该时长即视为异常，加快兜底频率
+WS_RECONCILE_INTERVAL = 300  # 连接健康时的周期对账间隔（秒）
+WS_STALE_TIMEOUT = 90        # 超过该时长没收到任何入站消息（含 Pong）即断开重连
+WS_MIN_STABLE_SECONDS = 60   # 连接稳定存活该时长后重置重连退避
 
 async def generate_uuid() -> str:
     """生成符合特定格式的 UUID 字符串。"""
@@ -75,7 +77,7 @@ async def start_websocket_connection(hass, entry, session):
                     _LOGGER.info(f"WebSocket 连接已建立 (重试次数: {retry_count})")
 
                     tasks = [
-                        asyncio.create_task(send_heartbeat(ws), name="kiwiot-heartbeat"),
+                        asyncio.create_task(send_heartbeat(ws, domain_data), name="kiwiot-heartbeat"),
                         asyncio.create_task(handle_websocket_messages(ws, hass, entry), name="kiwiot-receiver"),
                         asyncio.create_task(process_message_queue(ws, msg_queue), name="kiwiot-sender")
                     ]
@@ -138,12 +140,25 @@ async def start_websocket_connection(hass, entry, session):
     finally:
         resync_task.cancel()
 
-async def send_heartbeat(ws):
-    """发送心跳消息。"""
+async def send_heartbeat(ws, domain_data=None):
+    """发送心跳消息，并在长时间收不到任何入站消息时主动断开以触发重连。
+
+    服务端会对 Iot.Application/Ping 回 Pong（实测每 30 秒一次），因此
+    “超过 90 秒没有任何入站消息”就是连接已死（含 TCP 半开）的可靠信号。
+    """
 
     interval = 30
     try:
         while not ws.closed:
+            if domain_data is not None:
+                last_message = domain_data.get("last_ws_message") or 0.0
+                if (time.monotonic() - last_message) > WS_STALE_TIMEOUT:
+                    _LOGGER.warning(
+                        "超过 %s 秒未收到任何服务端消息（含 Pong），判定连接失效并重连",
+                        WS_STALE_TIMEOUT,
+                    )
+                    await ws.close()
+                    return
             uuid = await generate_uuid()
             ping_message = {
                 "header": {
@@ -432,15 +447,19 @@ async def resync_loop(hass, entry, session):
     这类故障不产生任何异常，只靠重连逻辑发现不了。这里用 REST 轮询兜底，
     保证即使 WebSocket 彻底哑掉，事件最多延迟一个轮询周期也能补进实体。
     """
+    last_reconcile = 0.0
     while True:
         try:
             await asyncio.sleep(WS_SYNC_INTERVAL)
             if DOMAIN not in hass.data or session.closed:
                 return
+            now = time.monotonic()
             last_message = hass.data[DOMAIN].get("last_ws_message") or 0.0
-            if (time.monotonic() - last_message) < WS_QUIET_WINDOW:
-                # WebSocket 还在正常收消息，不需要额外请求
+            quiet = (now - last_message) >= WS_QUIET_WINDOW
+            if not quiet and (now - last_reconcile) < WS_RECONCILE_INTERVAL:
+                # 连接在正常收 Pong/事件，按低频节奏对账即可（约每 5 分钟一次）
                 continue
+            last_reconcile = now
             await sync_latest_events(hass, entry, session)
         except asyncio.CancelledError:
             raise
