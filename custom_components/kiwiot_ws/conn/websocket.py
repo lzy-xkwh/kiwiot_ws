@@ -74,7 +74,11 @@ async def start_websocket_connection(hass, entry, session):
                     domain_data["ws"] = ws
                     connected_at = time.monotonic()
                     domain_data["last_ws_message"] = connected_at
-                    _LOGGER.info(f"WebSocket 连接已建立 (重试次数: {retry_count})")
+                    if retry_count:
+                        # 重连成功用 WARNING 记一条，默认日志级别下也能看到断线恢复
+                        _LOGGER.warning("WebSocket 重连成功 (已重试 %s 次)", retry_count)
+                    else:
+                        _LOGGER.info("WebSocket 连接已建立")
 
                     tasks = [
                         asyncio.create_task(send_heartbeat(ws, domain_data), name="kiwiot-heartbeat"),
@@ -100,18 +104,16 @@ async def start_websocket_connection(hass, entry, session):
 
                     for task in done:
                         if task.cancelled():
-                            _LOGGER.warning("WebSocket 子任务被取消: %s", task.get_name())
-                            continue
-                        exc = task.exception()
-                        if exc:
-                            _LOGGER.warning(
-                                "WebSocket 子任务异常结束: %s -> %r", task.get_name(), exc
-                            )
+                            detail = "被取消"
                         else:
-                            _LOGGER.warning(
-                                "WebSocket 子任务结束，连接已不可用，准备重连: %s",
-                                task.get_name(),
-                            )
+                            exc = task.exception()
+                            detail = f"异常 {exc!r}" if exc else "正常结束（无异常）"
+                        # close_code 是判断“为什么断”的关键证据：
+                        # 1000=正常关闭, 1006=异常断开(无关闭帧), 4xxx=服务端业务原因
+                        _LOGGER.warning(
+                            "WebSocket 子任务结束，连接已不可用，准备重连: %s | %s | close_code=%s",
+                            task.get_name(), detail, ws.close_code,
+                        )
 
             except asyncio.CancelledError:
                 _LOGGER.info("WebSocket任务被取消")
@@ -238,11 +240,18 @@ async def handle_websocket_messages(ws, hass, entry):
                     _LOGGER.error(f"JSON解析错误: {e}")
                     continue
                     
+            elif msg.type == aiohttp.WSMsgType.CLOSE:
+                # 服务端主动关闭：msg.data 是关闭码，msg.extra 是原因文本
+                _LOGGER.warning(
+                    "服务端请求关闭连接: code=%s reason=%r", msg.data, msg.extra
+                )
+            elif msg.type == aiohttp.WSMsgType.CLOSING:
+                _LOGGER.warning("WebSocket 正在关闭: close_code=%s", ws.close_code)
             elif msg.type == aiohttp.WSMsgType.ERROR:
-                _LOGGER.error(f"WebSocket 错误: {msg.data}")
+                _LOGGER.error("WebSocket 错误: %r", msg.data)
                 break
             elif msg.type == aiohttp.WSMsgType.CLOSED:
-                _LOGGER.warning("WebSocket 连接已关闭")
+                _LOGGER.warning("WebSocket 连接已关闭: close_code=%s", ws.close_code)
                 break
             
     except asyncio.CancelledError:
@@ -255,6 +264,7 @@ async def handle_websocket_messages(ws, hass, entry):
                 future.set_exception(e)
         raise
     finally:
+        _LOGGER.info("接收循环结束: close_code=%s", ws.close_code)
         for future in response_futures.values():
             if not future.done():
                 future.cancel()
