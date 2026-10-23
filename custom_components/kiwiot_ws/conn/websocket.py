@@ -4,6 +4,7 @@ import asyncio
 import re
 import random
 import json
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any
@@ -11,15 +12,20 @@ from ..entity.lock import KiwiLockEvent, KiwiLockCamera, KiwiLockStatus
 from ..lock import KiwiLockEntity
 from ..battery_sensor import KiwiLockBatterySensor
 from ..const import LOGGER_NAME, WS_URL, DOMAIN
-from .utils import convert_wsevent_format, convert_media_event_format
+from .utils import convert_wsevent_format, convert_media_event_format, get_latest_event
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from .userinfo import get_llock_userinfo
+from .userinfo import get_llock_userinfo, get_llock_info
 from .token_manager import TokenManager
 from ..event_utils import event_name, event_label, lock_state
 
 _LOGGER = logging.getLogger(f"{LOGGER_NAME}_{__name__}")
 
 response_futures: Dict[str, asyncio.Future] = {}
+
+# WebSocket 健康检查参数
+WS_SYNC_INTERVAL = 60       # REST 兜底轮询间隔（秒）
+WS_QUIET_WINDOW = 180       # WebSocket 静默超过该时长才启用兜底轮询
+WS_MIN_STABLE_SECONDS = 60  # 连接稳定存活该时长后重置重连退避
 
 async def generate_uuid() -> str:
     """生成符合特定格式的 UUID 字符串。"""
@@ -36,72 +42,101 @@ async def start_websocket_connection(hass, entry, session):
     base_retry_delay = 5
 
     msg_queue = asyncio.Queue()
-    hass.data[DOMAIN]["msg_queue"] = msg_queue
+    domain_data = hass.data.get(DOMAIN)
+    if domain_data is None:
+        _LOGGER.warning("集成数据不存在，不启动 WebSocket 连接")
+        return
+    domain_data["msg_queue"] = msg_queue
+    domain_data.setdefault("last_ws_message", 0.0)
+    domain_data.setdefault("last_event_at", {})
 
     retry_count = 0
-    while True:
-        try:
+    resync_task = asyncio.create_task(resync_loop(hass, entry, session))
+    try:
+        while True:
             if session.closed:
-                _LOGGER.warning("Session已关闭,停止WebSocket连接") 
+                _LOGGER.warning("Session已关闭,停止WebSocket连接")
                 return
             if DOMAIN not in hass.data:
                 _LOGGER.warning("集成已被移除,停止WebSocket连接")
                 return
 
-            access_token = await token_manager.get_token(session)
-            ws_url = f"{WS_URL}/?access_token={access_token}"
+            connected_at = None
+            try:
+                access_token = await token_manager.get_token(session)
+                if not access_token:
+                    raise RuntimeError("无法获取有效的 access_token")
+                ws_url = f"{WS_URL}/?access_token={access_token}"
 
-            async with session.ws_connect(ws_url) as ws:
-                hass.data[DOMAIN]["ws"] = ws
-                _LOGGER.info(f"WebSocket 连接已建立 (重试次数: {retry_count})")
+                async with session.ws_connect(ws_url) as ws:
+                    domain_data["ws"] = ws
+                    connected_at = time.monotonic()
+                    domain_data["last_ws_message"] = connected_at
+                    _LOGGER.info(f"WebSocket 连接已建立 (重试次数: {retry_count})")
 
-                tasks = [
-                    asyncio.create_task(send_heartbeat(ws)),
-                    asyncio.create_task(handle_websocket_messages(ws, hass, entry)),
-                    asyncio.create_task(process_message_queue(ws, msg_queue))
-                ]
+                    tasks = [
+                        asyncio.create_task(send_heartbeat(ws), name="kiwiot-heartbeat"),
+                        asyncio.create_task(handle_websocket_messages(ws, hass, entry), name="kiwiot-receiver"),
+                        asyncio.create_task(process_message_queue(ws, msg_queue), name="kiwiot-sender")
+                    ]
 
-                try:
-                    done, pending = await asyncio.wait(
-                        tasks, 
-                        return_when=asyncio.FIRST_EXCEPTION
-                    )
-
-                    for task in pending:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                    # 用 FIRST_COMPLETED 而不是 FIRST_EXCEPTION：接收循环在服务端
+                    # 正常关闭连接（收到 CLOSED 帧）时会“无异常地返回”，
+                    # FIRST_EXCEPTION 此时不会唤醒，配合永不结束的消息队列任务，
+                    # 监控协程会永久卡住 —— 连接静默死亡且永不重连（事件全部丢失）。
+                    try:
+                        done, _pending = await asyncio.wait(
+                            tasks,
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        domain_data["ws"] = None
 
                     for task in done:
+                        if task.cancelled():
+                            _LOGGER.warning("WebSocket 子任务被取消: %s", task.get_name())
+                            continue
                         exc = task.exception()
                         if exc:
-                            _LOGGER.error(f"WebSocket任务异常: {exc}")
-                            raise exc
+                            _LOGGER.warning(
+                                "WebSocket 子任务异常结束: %s -> %r", task.get_name(), exc
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "WebSocket 子任务结束，连接已不可用，准备重连: %s",
+                                task.get_name(),
+                            )
 
-                except asyncio.CancelledError:
-                    _LOGGER.info("WebSocket任务被取消")
+            except asyncio.CancelledError:
+                _LOGGER.info("WebSocket任务被取消")
+                raise
+            except aiohttp.ClientError as e:
+                if "Session is closed" in str(e):
+                    _LOGGER.warning("Session已关闭,停止重试")
                     return
+                _LOGGER.error(f"WebSocket 连接错误: {e}")
+                retry_count += 1
+            except Exception as e:
+                _LOGGER.error(f"WebSocket 连接发生未知异常: {e}")
+                retry_count += 1
 
-        except aiohttp.ClientError as e:
-            if "Session is closed" in str(e):
-                _LOGGER.warning("Session已关闭,停止重试")
+            # 连接稳定存活过一段时间，视为链路已恢复，重置退避
+            if connected_at and (time.monotonic() - connected_at) >= WS_MIN_STABLE_SECONDS:
+                retry_count = 0
+
+            # 无限重连，除非集成被移除或 session 关闭
+            if DOMAIN not in hass.data or session.closed:
+                _LOGGER.warning("集成已被移除或session已关闭,停止重连")
                 return
-            _LOGGER.error(f"WebSocket 连接错误: {e}")
-            retry_count += 1
-
-        except Exception as e:
-            _LOGGER.error(f"WebSocket 连接发生未知异常: {e}")
-            retry_count += 1
-
-        # 无限重连，除非集成被移除或 session 关闭
-        if DOMAIN not in hass.data or session.closed:
-            _LOGGER.warning("集成已被移除或session已关闭,停止重连")
-            return
-        wait_time = base_retry_delay * min(10, 2 ** retry_count)
-        _LOGGER.info(f"等待 {wait_time} 秒后重试连接 (当前重试次数: {retry_count})")
-        await asyncio.sleep(wait_time)
+            wait_time = base_retry_delay * min(10, 2 ** retry_count)
+            _LOGGER.info(f"等待 {wait_time} 秒后重试连接 (当前重试次数: {retry_count})")
+            await asyncio.sleep(wait_time)
+    finally:
+        resync_task.cancel()
 
 async def send_heartbeat(ws):
     """发送心跳消息。"""
@@ -167,6 +202,9 @@ async def handle_websocket_messages(ws, hass, entry):
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
+                    domain_state = hass.data.get(DOMAIN)
+                    if domain_state is not None:
+                        domain_state["last_ws_message"] = time.monotonic()
                     _LOGGER.debug("接收到消息: %s", data)
                     
                     header = data.get("header", {})
@@ -226,21 +264,30 @@ async def process_device_event(hass, entry, data):
             payload["name"] = normalized_name or "UNKNOWN"
             payload.setdefault("data", {})
             _LOGGER.debug("Received KiwiOT event: %s (%s)", event_label(payload), event_type)
-        await update_device_state(hass, entry, device_id, payload)
-        hass.bus.async_fire(
-            f"{DOMAIN}_event",
-            {
-                "device_id": device_id,
-                "event": normalized_name or "UNKNOWN",
-                "label": event_label(payload),
-                "level": event_type,
-                "created_at": payload.get("created_at"),
-                "data": payload.get("data", {}),
-            },
-        )
-        
+        await apply_device_event(hass, entry, device_id, payload)
+
     except Exception as e:
         _LOGGER.error("处理设备事件失败: %s", e)
+
+
+async def apply_device_event(hass, entry, device_id, payload):
+    """把事件写入实体并广播 kiwiot_ws_event 总线事件（WebSocket 与兜底同步共用）。"""
+    await update_device_state(hass, entry, device_id, payload)
+    hass.bus.async_fire(
+        f"{DOMAIN}_event",
+        {
+            "device_id": device_id,
+            "event": event_name(payload) or "UNKNOWN",
+            "label": event_label(payload),
+            "level": payload.get("level"),
+            "created_at": payload.get("created_at"),
+            "data": payload.get("data", {}),
+        },
+    )
+    created_at = _event_created_at(payload)
+    domain_state = hass.data.get(DOMAIN)
+    if created_at and domain_state is not None:
+        domain_state.setdefault("last_event_at", {})[device_id] = created_at
 
 async def update_battery_state(hass, device_id, payload):
     """Update a lock battery sensor directly from an unmodified payload."""
@@ -376,3 +423,108 @@ async def process_message_queue(ws, queue):
         for fut in response_futures.values():
             if not fut.done():
                 fut.cancel()
+
+
+async def resync_loop(hass, entry, session):
+    """REST 兜底同步：WebSocket 长时间没有任何消息时主动拉取最新事件。
+
+    WebSocket 可能“连接还在、但服务端不再推送”（半开连接、服务端静默丢弃订阅等）。
+    这类故障不产生任何异常，只靠重连逻辑发现不了。这里用 REST 轮询兜底，
+    保证即使 WebSocket 彻底哑掉，事件最多延迟一个轮询周期也能补进实体。
+    """
+    while True:
+        try:
+            await asyncio.sleep(WS_SYNC_INTERVAL)
+            if DOMAIN not in hass.data or session.closed:
+                return
+            last_message = hass.data[DOMAIN].get("last_ws_message") or 0.0
+            if (time.monotonic() - last_message) < WS_QUIET_WINDOW:
+                # WebSocket 还在正常收消息，不需要额外请求
+                continue
+            await sync_latest_events(hass, entry, session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _LOGGER.debug("REST 兜底同步失败: %s", e)
+
+
+async def sync_latest_events(hass, entry, session):
+    """拉取每台设备的最新事件，比实体当前事件更新则补写。"""
+    devices = hass.data.get(DOMAIN, {}).get("devices", {})
+    for device_id in list(devices):
+        try:
+            events = await get_llock_info(hass, entry, device_id, session)
+            latest = await get_latest_event(events) if events else None
+            if not latest or not _is_event_newer(hass, device_id, latest):
+                continue
+            payload = _normalize_rest_event(latest, device_id)
+            _LOGGER.warning(
+                "WebSocket 静默，已通过 REST 补回事件: %s %s (%s)",
+                device_id, payload.get("name"), payload.get("created_at"),
+            )
+            await apply_device_event(hass, entry, device_id, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _LOGGER.debug("同步设备 %s 事件失败: %s", device_id, e)
+
+
+def _event_created_at(event):
+    if isinstance(event, dict) and event.get("created_at"):
+        return str(event["created_at"])
+    return None
+
+
+def _parse_event_time(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _entity_event_created_at(hass, device_id):
+    entities = hass.data.get(DOMAIN, {}).get("devices", {}).get(device_id, [])
+    for entity in entities:
+        for attr in ("_event", "_event_data"):
+            created_at = _event_created_at(getattr(entity, attr, None))
+            if created_at:
+                return created_at
+    return None
+
+
+def _is_event_newer(hass, device_id, event):
+    """判断事件是否比实体当前事件更新（首次同步以实体当前事件为基线）。"""
+    created_at = _event_created_at(event)
+    domain_state = hass.data.get(DOMAIN)
+    if not created_at or domain_state is None:
+        return False
+    markers = domain_state.setdefault("last_event_at", {})
+    previous = markers.get(device_id) or _entity_event_created_at(hass, device_id)
+    if not previous:
+        markers[device_id] = created_at
+        return False
+    new_time = _parse_event_time(created_at)
+    old_time = _parse_event_time(previous)
+    if new_time is None or old_time is None:
+        if created_at == previous:
+            return False
+        markers[device_id] = created_at
+        return True
+    if new_time <= old_time:
+        return False
+    markers[device_id] = created_at
+    return True
+
+
+def _normalize_rest_event(event, device_id):
+    """把 REST 事件整理成和 WebSocket 事件一致的结构。"""
+    payload = dict(event)
+    payload.setdefault("did", device_id)
+    payload["name"] = event_name(payload) or "UNKNOWN"
+    data = dict(payload.get("data") or {})
+    if "image" not in data and data.get("image_uri"):
+        data["image"] = {"uri": data["image_uri"]}
+    payload["data"] = data
+    return payload

@@ -5,7 +5,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, LOGGER_NAME, CONF_CLIENT_ID, CONF_IGNORE_SSL
-from .conn.websocket import start_websocket_connection
+from .conn.websocket import start_websocket_connection, stop_websocket_connection
 from .device_manager import initialize_devices_and_groups
 from .conn.token_manager import TokenManager
 
@@ -79,8 +79,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # 注册平台
             await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-            # 启动 WebSocket 连接
-            hass.loop.create_task(start_websocket_connection(hass, entry, session))
+            # 启动 WebSocket 连接（保存任务句柄，卸载/重载时取消，避免残留旧连接）
+            ws_task = hass.loop.create_task(
+                start_websocket_connection(hass, entry, session)
+            )
+            hass.data[DOMAIN]["ws_task"] = ws_task
 
             _LOGGER.info(f"KiwiOT 集成已成功初始化，添加了 {len(entities_to_add)} 个实体")
             return True
@@ -104,6 +107,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     
     if unload_ok:
+        # 先停掉 WebSocket 任务，否则重载后会残留旧连接任务继续跑
+        ws_task = hass.data.get(DOMAIN, {}).get("ws_task")
+        if ws_task:
+            await stop_websocket_connection(ws_task)
         # 关闭 session
         session = hass.data[DOMAIN].get("session")
         if session:
